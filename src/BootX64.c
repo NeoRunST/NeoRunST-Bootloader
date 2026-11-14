@@ -23,6 +23,9 @@ typedef struct {
 
 #define PSF1_MAGIC0 0x36
 #define PSF1_MAGIC1 0x04
+#define MAX_LOAD_SEGMENT_BYTES 0x20000000ULL
+#define MAX_FONT_FILE_BYTES     0x00400000ULL
+#define MAX_KERNEL_FILE_BYTES   0x10000000ULL
 
 typedef struct { unsigned char magic[2]; unsigned char mode; unsigned char charSize; } PSF1_HEADER;
 typedef struct { PSF1_HEADER* psf1_header; void* glyphBuffer; } PSF1_FONT;
@@ -36,6 +39,36 @@ typedef struct {
     void*                  rsdp;
     VOID*                  runtime_services;
 } BootInfo;
+
+#define MAX_PHDR_COUNT 64
+
+typedef struct { UINT64 Base; UINT64 Size; } LOAD_RANGE;
+
+typedef struct {
+    LOAD_RANGE Slots[MAX_PHDR_COUNT];
+    int        Count;
+} LOAD_MAP;
+
+static VOID LoadMapAdd(LOAD_MAP* Map, UINT64 Base, UINT64 Size)
+{
+    if (Map == NULL || Map->Count >= MAX_PHDR_COUNT) return;
+    Map->Slots[Map->Count].Base = Base;
+    Map->Slots[Map->Count].Size = Size;
+    Map->Count++;
+}
+
+static BOOLEAN LoadMapOverlaps(const LOAD_MAP* Map, UINT64 Base, UINT64 Size)
+{
+    if (Map == NULL || Size == 0) return FALSE;
+    for (int i = 0; i < Map->Count; i++) {
+        UINT64 OBase = Map->Slots[i].Base;
+        UINT64 OSize = Map->Slots[i].Size;
+        if (Base >= OBase + OSize) continue;
+        if (OBase >= Base + Size)   continue;
+        return TRUE;
+    }
+    return FALSE;
+}
 
 /* ============================================================
  * 分级日志(unix/systemd 风格)
@@ -88,6 +121,90 @@ static INTN MemCmp(const VOID* aptr, const VOID* bptr, UINTN n)
 /* ============================================================
  * 文件加载(带完整错误检查)
  * ============================================================ */
+static BOOLEAN PathHasDotDot(const CHAR16* p)
+{
+    const CHAR16* s = p;
+    while (*s) {
+        while (*s == L'/' || *s == L'\\') s++;
+        const CHAR16* seg = s;
+        while (*s && *s != L'/' && *s != L'\\') s++;
+        if ((UINTN)(s - seg) == 2 && seg[0] == L'.' && seg[1] == L'.') return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOLEAN PathHasVolumePrefix(const CHAR16* p)
+{
+    while (*p) {
+        if (*p == L':') return TRUE;
+        p++;
+    }
+    return FALSE;
+}
+
+static BOOLEAN PathHasControlChar(const CHAR16* p)
+{
+    while (*p) {
+        if (*p < 0x20 || *p == 0x7F) return TRUE;
+        p++;
+    }
+    return FALSE;
+}
+
+static BOOLEAN PathExceedsLimit(const CHAR16* p, UINTN Limit)
+{
+    UINTN n = 0;
+    while (p[n]) {
+        n++;
+        if (n >= Limit) return TRUE;
+    }
+    return FALSE;
+}
+
+static EFI_FILE* LoadFileChecked(EFI_FILE* Directory, CHAR16* Path,
+                                  UINTN MaxBytes, UINTN* OutSize,
+                                  EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
+{
+    EFI_FILE* File = LoadFile(Directory, Path, ImageHandle, SystemTable);
+    if (File == NULL) return NULL;
+
+    UINTN InfoSize = 0;
+    EFI_STATUS s = File->GetInfo(File, &gEfiFileInfoGuid, &InfoSize, NULL);
+    if (EFI_ERROR(s) && s != EFI_BUFFER_TOO_SMALL) {
+        WARN(L"GetInfo(size) failed for %s (0x%llx)", Path, s);
+        uefi_call_wrapper(File->Close, 1, File);
+        return NULL;
+    }
+    EFI_FILE_INFO* Info = NULL;
+    s = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, InfoSize, (VOID**)&Info);
+    if (EFI_ERROR(s)) {
+        uefi_call_wrapper(File->Close, 1, File);
+        return NULL;
+    }
+    s = File->GetInfo(File, &gEfiFileInfoGuid, &InfoSize, (VOID**)&Info);
+    if (EFI_ERROR(s)) {
+        uefi_call_wrapper(BS->FreePool, 1, Info);
+        uefi_call_wrapper(File->Close, 1, File);
+        return NULL;
+    }
+    if (Info->Attribute & EFI_FILE_DIRECTORY) {
+        FAIL(L"Directory rejected where a regular file is required: %s", Path);
+        uefi_call_wrapper(BS->FreePool, 1, Info);
+        uefi_call_wrapper(File->Close, 1, File);
+        return NULL;
+    }
+    if (Info->FileSize == 0 || Info->FileSize > MaxBytes) {
+        FAIL(L"File size out of accepted range: %ld bytes (limit %ld)",
+             (UINT64)Info->FileSize, (UINT64)MaxBytes);
+        uefi_call_wrapper(BS->FreePool, 1, Info);
+        uefi_call_wrapper(File->Close, 1, File);
+        return NULL;
+    }
+    if (OutSize != NULL) *OutSize = (UINTN)Info->FileSize;
+    uefi_call_wrapper(BS->FreePool, 1, Info);
+    return File;
+}
+
 static EFI_FILE* LoadFile(EFI_FILE* Directory, CHAR16* Path,
                           EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
 {
@@ -95,6 +212,12 @@ static EFI_FILE* LoadFile(EFI_FILE* Directory, CHAR16* Path,
     EFI_LOADED_IMAGE_PROTOCOL*     LoadedImage = NULL;
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL* FileSystem = NULL;
     EFI_STATUS s;
+
+    if (Path == NULL || Path[0] == 0) { FAIL(L"Empty file path rejected"); return NULL; }
+    if (PathHasDotDot(Path)) { FAIL(L"Parent-directory segment rejected: %s", Path); return NULL; }
+    if (PathHasVolumePrefix(Path)) { FAIL(L"Volume-qualified path rejected: %s", Path); return NULL; }
+    if (PathHasControlChar(Path)) { FAIL(L"Control character in path rejected: %s", Path); return NULL; }
+    if (PathExceedsLimit(Path, 512)) { FAIL(L"Overlong path rejected"); return NULL; }
 
     s = uefi_call_wrapper(SystemTable->BootServices->HandleProtocol, 3,
             ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID**)&LoadedImage);
@@ -121,7 +244,8 @@ static EFI_FILE* LoadFile(EFI_FILE* Directory, CHAR16* Path,
 static PSF1_FONT* LoadPSF1Font(EFI_FILE* Directory, CHAR16* Path,
                                EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
 {
-    EFI_FILE* FontFile = LoadFile(Directory, Path, ImageHandle, SystemTable);
+    EFI_FILE* FontFile = LoadFileChecked(Directory, Path, MAX_FONT_FILE_BYTES,
+                                         NULL, ImageHandle, SystemTable);
     if (FontFile == NULL) { WARN(L"Font file not found: %s", Path); return NULL; }
 
     EFI_STATUS s;
@@ -137,10 +261,20 @@ static PSF1_FONT* LoadPSF1Font(EFI_FILE* Directory, CHAR16* Path,
 
     if (FontHeader->magic[0] != PSF1_MAGIC0 || FontHeader->magic[1] != PSF1_MAGIC1) {
         WARN(L"PSF1 magic mismatch (got %02x %02x)", FontHeader->magic[0], FontHeader->magic[1]);
+        uefi_call_wrapper(FontFile->Close, 1, FontFile);
+        uefi_call_wrapper(BS->FreePool, 1, FontHeader);
+        return NULL;
+    }
+    if (FontHeader->charSize == 0 || FontHeader->charSize > 32 || FontHeader->mode > 1) {
+        WARN(L"PSF1 header out of range (charSize %d, mode %d), font rejected",
+             FontHeader->charSize, FontHeader->mode);
+        uefi_call_wrapper(FontFile->Close, 1, FontFile);
+        uefi_call_wrapper(BS->FreePool, 1, FontHeader);
         return NULL;
     }
 
     UINTN GlyphBufferSize = FontHeader->charSize * ((FontHeader->mode == 1) ? 512 : 256);
+    UINTN GlyphBufferWant = GlyphBufferSize;
     VOID* GlyphBuffer = NULL;
 
     s = uefi_call_wrapper(FontFile->SetPosition, 2, FontFile, sizeof(PSF1_HEADER));
@@ -150,6 +284,14 @@ static PSF1_FONT* LoadPSF1Font(EFI_FILE* Directory, CHAR16* Path,
     CHECK(s, L"AllocatePool(glyphs)");
     s = uefi_call_wrapper(FontFile->Read, 3, FontFile, &GlyphBufferSize, GlyphBuffer);
     CHECK(s, L"Read(glyphs)");
+    if (GlyphBufferSize != GlyphBufferWant) {
+        WARN(L"PSF1 glyph data truncated (%d of %d bytes), font rejected",
+             GlyphBufferSize, GlyphBufferWant);
+        uefi_call_wrapper(FontFile->Close, 1, FontFile);
+        uefi_call_wrapper(BS->FreePool, 1, GlyphBuffer);
+        uefi_call_wrapper(BS->FreePool, 1, FontHeader);
+        return NULL;
+    }
     uefi_call_wrapper(FontFile->Close, 1, FontFile);
 
     PSF1_FONT* FinishedFont = NULL;
@@ -184,6 +326,12 @@ static FrameBuffer* InitializeGOP(VOID)
         s = uefi_call_wrapper(BS->HandleProtocol, 3,
                 Handles[0], &GopGuid, (VOID**)&Gop);
         CHECK(s, L"HandleProtocol(GOP)");
+        uefi_call_wrapper(BS->FreePool, 1, Handles);
+    }
+
+    if (Gop->Mode == NULL || Gop->Mode->Info == NULL || Gop->Mode->FrameBufferBase == 0) {
+        FAIL(L"GOP mode info is unavailable, refusing to touch the framebuffer");
+        return NULL;
     }
 
     GopFrame.BaseAddress       = (VOID*)Gop->Mode->FrameBufferBase;
@@ -208,6 +356,7 @@ static FrameBuffer* InitializeGOP(VOID)
 static UINTN ReadLine(CHAR16* Buf, UINTN Max)
 {
     UINTN Len = 0;
+    if (Max == 0) return 0;
     for (;;) {
         UINTN idx;
         uefi_call_wrapper(BS->WaitForEvent, 3, 1, &ST->ConIn->WaitForKey, &idx);
@@ -224,9 +373,13 @@ static UINTN ReadLine(CHAR16* Buf, UINTN Max)
         if (Key.UnicodeChar == 0x03) {                              /* Ctrl+C */
             Print(L"^C\r\n"); Buf[0] = 0; return 0;
         }
-        if (Key.UnicodeChar >= 0x20 && Key.UnicodeChar < 0x7F && Len < Max - 1) {
-            Buf[Len++] = Key.UnicodeChar;
-            Print(L"%c", Key.UnicodeChar);
+        if (Key.UnicodeChar >= 0x20 && Key.UnicodeChar < 0x7F) {
+            if (Len < Max - 1) {
+                Buf[Len++] = Key.UnicodeChar;
+                Print(L"%c", Key.UnicodeChar);
+            } else {
+                Print(L"\a");
+            }
         }
     }
 }
@@ -259,6 +412,7 @@ static const CHAR16* MemTypeStr(UINT32 t)
 static VOID PrintMemoryMap(EFI_MEMORY_DESCRIPTOR* Map, UINTN MapSize, UINTN DescSize)
 {
     Print(L"  %-16s %-14s %-10s %s\r\n", L"TYPE", L"START", L"PAGES", L"BYTES");
+    if (DescSize == 0) return;
     for (UINTN off = 0; off < MapSize; off += DescSize) {
         EFI_MEMORY_DESCRIPTOR* d = (EFI_MEMORY_DESCRIPTOR*)((CHAR8*)Map + off);
         Print(L"  %-16ls 0x%012lx %-10lx %ld KB\r\n",
@@ -277,7 +431,7 @@ static VOID Shell(FrameBuffer* Fb, PSF1_FONT* Font, VOID* Rsdp,
     Print(L"\r\nType 'help' for available commands.\r\n");
     for (;;) {
         Print(L"neorunstboot> ");
-        ReadLine(Buf, 128);
+        ReadLine(Buf, sizeof(Buf) / sizeof(Buf[0]));
         if (!Buf[0]) continue;
 
         if (!StrCmp(Buf, L"help")) {
@@ -400,6 +554,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
     OK(L"Kernel file opened");
 
     Elf64_Ehdr Header;
+    UINTN KernelFileSize = 0;
     {
         UINTN FileInfoSize = 0;
         EFI_FILE_INFO* FileInfo = NULL;
@@ -416,6 +571,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
 
         UINTN size = sizeof(Header);
         CHECK(Kernel->Read(Kernel, &size, &Header), L"Read(ELF header)");
+        KernelFileSize = FileInfo->FileSize;
+        if (KernelFileSize > MAX_KERNEL_FILE_BYTES) {
+            FatalMsg(L"Kernel image exceeds the accepted hard limit");
+        }
         OK(L"File size: %ld bytes", (UINT64)FileInfo->FileSize);
     }
 
@@ -431,16 +590,31 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
 
     /* ---------- 阶段 2: 按 program header 装载段 ---------- */
     STAGE(L"Stage 2/5  Load kernel segments");
+    if (Header.e_phentsize != sizeof(Elf64_Phdr) || Header.e_phnum == 0) {
+        FatalMsg(L"Invalid program header table (bad e_phentsize/e_phnum)");
+    }
+    if (Header.e_phnum > MAX_PHDR_COUNT) {
+        FatalMsg(L"Program header count exceeds the accepted limit");
+    }
+    {
+        UINT64 TableBytes = (UINT64)Header.e_phnum * (UINT64)Header.e_phentsize;
+        if (Header.e_phoff > KernelFileSize || TableBytes > KernelFileSize - Header.e_phoff) {
+            FatalMsg(L"Program header table lies outside the kernel file");
+        }
+    }
     Elf64_Phdr* Phdrs = NULL;
     CHECK(Kernel->SetPosition(Kernel, Header.e_phoff), L"SetPosition(phdrs)");
     {
-        UINTN size = Header.e_phnum * Header.e_phentsize;
+        UINTN want = Header.e_phnum * Header.e_phentsize;
+        UINTN size = want;
         CHECK(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
               size, (VOID**)&Phdrs), L"AllocatePool(phdrs)");
         CHECK(Kernel->Read(Kernel, &size, Phdrs), L"Read(phdrs)");
+        if (size != want) FatalMsg(L"Program header table truncated");
     }
 
     int LoadedSegs = 0;
+    LOAD_MAP LoadMap; LoadMap.Count = 0;
     UINTN KernelEntryPhys = 0;   /* 物理入口: e_entry 所在段的加载地址 + 段内偏移 */
     for (Elf64_Phdr* Phdr = Phdrs;
          (CHAR8*)Phdr < (CHAR8*)Phdrs + Header.e_phnum * Header.e_phentsize;
@@ -448,8 +622,37 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
     {
         if (Phdr->p_type != PT_LOAD) continue;
 
-        UINTN Pages = (Phdr->p_memsz + 0xFFF) / 0x1000;
-        UINT64 Segment = Phdr->p_paddr ? Phdr->p_paddr : Phdr->p_vaddr;
+        if (Phdr->p_memsz == 0 || Phdr->p_filesz > Phdr->p_memsz) {
+            FatalMsg(L"Invalid PT_LOAD segment size (filesz > memsz or memsz == 0)");
+        }
+        if (Phdr->p_offset > KernelFileSize ||
+            Phdr->p_filesz > KernelFileSize - Phdr->p_offset) {
+            FatalMsg(L"PT_LOAD segment exceeds kernel file boundary");
+        }
+        if (Phdr->p_memsz > MAX_LOAD_SEGMENT_BYTES) {
+            FatalMsg(L"PT_LOAD segment size exceeds loader limit");
+        }
+        if (Phdr->p_vaddr + Phdr->p_memsz < Phdr->p_vaddr) {
+            FatalMsg(L"PT_LOAD virtual range wraps around");
+        }
+        if (Phdr->p_align > 0x1000 &&
+            (Phdr->p_vaddr % Phdr->p_align) != (Phdr->p_offset % Phdr->p_align)) {
+            FatalMsg(L"PT_LOAD vaddr/offset disagree with p_align");
+        }
+        if (Phdr->p_vaddr < 0x1000) {
+            FatalMsg(L"PT_LOAD virtual address overlaps the null page");
+        }
+
+        UINT64 Want = Phdr->p_paddr ? Phdr->p_paddr : Phdr->p_vaddr;
+        UINTN  PageOff = (UINTN)(Want & 0xFFFULL);
+        UINT64 PageBase = Want & ~0xFFFULL;
+        UINT64 Span = (UINT64)PageOff + Phdr->p_memsz;
+        UINTN Pages = (UINTN)((Span + 0xFFF) / 0x1000);
+        UINT64 Segment = PageBase;
+
+        if (LoadMapOverlaps(&LoadMap, PageBase, (UINT64)Pages * 0x1000)) {
+            FatalMsg(L"PT_LOAD segments overlap in physical memory");
+        }
 
         EFI_STATUS s = uefi_call_wrapper(BS->AllocatePages, 5, AllocateAddress,
                 EfiLoaderData, Pages, &Segment);
@@ -458,12 +661,18 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
             Segment = 0x100000;   /* 回退: 1MiB 以上任意可用位置 */
             CHECK(uefi_call_wrapper(BS->AllocatePages, 5, AllocateAnyPages,
                   EfiLoaderData, Pages, &Segment), L"AllocatePages(fallback failed)");
+            if (LoadMapOverlaps(&LoadMap, Segment, (UINT64)Pages * 0x1000)) {
+                FatalMsg(L"Relocated segment would overwrite an already loaded segment");
+            }
             WARN(L"Segment relocated to 0x%lx, make sure the kernel is position-independent!", Segment);
         }
+        LoadMapAdd(&LoadMap, Segment, (UINT64)Pages * 0x1000);
+        Segment = Segment + PageOff;
 
         CHECK(Kernel->SetPosition(Kernel, Phdr->p_offset), L"SetPosition(segment)");
         UINTN size = Phdr->p_filesz;
         CHECK(Kernel->Read(Kernel, &size, (VOID*)(UINTN)Segment), L"Read(segment)");
+        if (size != Phdr->p_filesz) FatalMsg(L"PT_LOAD segment truncated (short read)");
 
         /* BSS: memsz > filesz 的部分清零 */
         if (Phdr->p_memsz > Phdr->p_filesz)
@@ -478,11 +687,13 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
            (e_entry - 段 vaddr)。低半区 stub 段内 vaddr == paddr, 同样适用 */
         if (Header.e_entry >= Phdr->p_vaddr &&
             Header.e_entry <  Phdr->p_vaddr + Phdr->p_memsz) {
+            if (KernelEntryPhys != 0) FatalMsg(L"e_entry matches more than one PT_LOAD segment");
             KernelEntryPhys = Segment + (Header.e_entry - Phdr->p_vaddr);
         }
         LoadedSegs++;
     }
     if (LoadedSegs == 0) FatalMsg(L"Kernel has no PT_LOAD segments");
+    if (KernelEntryPhys == 0) FatalMsg(L"Kernel e_entry lies outside every PT_LOAD segment");
     OK(L"%d segments loaded", LoadedSegs);
     uefi_call_wrapper(Kernel->Close, 1, Kernel);
 
@@ -594,7 +805,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable)
 
     /* 调试探针: 跳内核前把屏幕涂成品红色。
        品红出现后死 => 崩在内核接管之后; 屏幕没变品红 => 崩在固件侧 */
-    {
+    if (Fb != NULL && Fb->BaseAddress != NULL) {
         volatile UINT32* fbpx = (volatile UINT32*)Fb->BaseAddress;
         UINTN n = Fb->BufferSize / 4;
         for (UINTN i = 0; i < n; i++) fbpx[i] = 0x00FF00FF;   /* magenta */
